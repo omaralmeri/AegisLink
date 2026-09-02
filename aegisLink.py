@@ -22,18 +22,20 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-# Enable ANSI colors on Windows terminals
+# Ensure UTF-8 output and ANSI processing on Windows
 if sys.platform == "win32":
+    os.system('chcp 65001 > nul 2>&1')
     os.system('')
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding='utf-8')
 
-# ANSI Colors & Formatting
+
 class Style:
     RESET       = "\033[0m"
     BOLD        = "\033[1m"
     DIM         = "\033[2m"
     UNDERLINE   = "\033[4m"
     
-    # Foreground colors
     BLACK       = "\033[30m"
     RED         = "\033[31m"
     GREEN       = "\033[32m"
@@ -43,7 +45,6 @@ class Style:
     CYAN        = "\033[36m"
     WHITE       = "\033[37m"
     
-    # Bright foreground
     BRIGHT_RED     = "\033[91m"
     BRIGHT_GREEN   = "\033[92m"
     BRIGHT_YELLOW  = "\033[93m"
@@ -52,13 +53,13 @@ class Style:
     BRIGHT_CYAN    = "\033[96m"
     BRIGHT_WHITE   = "\033[97m"
     
-    # Backgrounds
     BG_RED      = "\033[41m"
     BG_GREEN    = "\033[42m"
     BG_YELLOW   = "\033[43m"
     BG_BLUE     = "\033[44m"
     BG_MAGENTA  = "\033[45m"
     BG_CYAN     = "\033[46m"
+
 
 BANNER = f"""{Style.BRIGHT_CYAN}
    █████╗ ███████╗ ██████╗ ██╗███████╗██╗     ██╗███╗   ██╗██╗  ██╗
@@ -67,7 +68,7 @@ BANNER = f"""{Style.BRIGHT_CYAN}
   ██╔══██║██╔══╝  ██║   ██║██║╚════██║██║     ██║██║╚██╗██║██╔═██╗ 
   ██║  ██║███████╗╚██████╔╝██║███████║███████╗██║██║ ╚████║██║  ██╗
   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝{Style.RESET}
-  {Style.BOLD}{Style.BRIGHT_MAGENTA}🛡️  AegisLink v2.0 - Ultimate URL & Web Threat Intelligence Scanner{Style.RESET}
+  {Style.BOLD}{Style.BRIGHT_MAGENTA}[*] AegisLink v2.0 - URL & Web Threat Intelligence Scanner{Style.RESET}
   {Style.DIM}Crafted for Cybersecurity Specialists & Incident Responders{Style.RESET}
   {Style.CYAN}{"═"*72}{Style.RESET}
 """
@@ -112,11 +113,13 @@ class RedirectHandler(urllib.request.HTTPRedirectHandler):
 
 class URLScanner:
     def __init__(self, target_url, timeout=8):
+        # Strip all whitespace and accidental unicode zero-width spaces
+        target_url = target_url.strip().replace('\u200b', '').replace('\ufeff', '')
         if not re.match(r'^[a-zA-Z]+://', target_url):
             target_url = "https://" + target_url
         self.target_url = target_url
         self.parsed = urllib.parse.urlparse(target_url)
-        self.hostname = self.parsed.hostname or ""
+        self.hostname = (self.parsed.hostname or "").strip()
         self.port = self.parsed.port or (443 if self.parsed.scheme == "https" else 80)
         self.scheme = self.parsed.scheme
         self.timeout = timeout
@@ -134,12 +137,17 @@ class URLScanner:
 
     def scan_dns(self):
         """Perform DNS and IP resolution"""
+        if not self.hostname:
+            self.results["dns"] = {"error": "Empty or invalid hostname", "ip_addresses": [], "primary_ip": "Unresolved"}
+            self.results["heuristics"]["flags"].append("Invalid hostname specified")
+            self.results["heuristics"]["risk_points"] += 40
+            return False
+
         try:
             ip_list = socket.gethostbyname_ex(self.hostname)
             canonical = ip_list[0]
             ips = ip_list[2]
             
-            # Reverse DNS lookup on first IP
             reverse_host = "Unknown"
             if ips:
                 try:
@@ -155,6 +163,7 @@ class URLScanner:
                 "reverse_dns": reverse_host,
                 "is_private_ip": any(self._is_private_ip(ip) for ip in ips)
             }
+            return True
         except socket.gaierror as e:
             self.results["dns"] = {
                 "error": f"Failed to resolve domain: {str(e)}",
@@ -163,9 +172,9 @@ class URLScanner:
             }
             self.results["heuristics"]["flags"].append("Domain does not resolve in DNS")
             self.results["heuristics"]["risk_points"] += 35
+            return False
 
     def _is_private_ip(self, ip):
-        """Check if an IP address belongs to RFC 1918 / Loopback"""
         private_patterns = [
             r'^10\.',
             r'^172\.(1[6-9]|2[0-9]|3[0-1])\.',
@@ -178,46 +187,39 @@ class URLScanner:
     def scan_heuristics(self):
         """Analyze URL structure for malicious or phishing patterns"""
         flags = []
-        score = 0
+        score = self.results["heuristics"]["risk_points"]
         
-        # 1. IP address used as hostname
         if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', self.hostname):
             flags.append("Hostname is a direct IP address (frequent in phishing / C2)")
             score += 30
 
-        # 2. Homograph / Punycode
         if "xn--" in self.hostname:
             flags.append("Punycode / IDN Homograph domain detected (potential spoofing)")
             score += 25
 
-        # 3. Excessive subdomains
         subdomain_parts = self.hostname.split(".")
         if len(subdomain_parts) > 4:
             flags.append(f"Excessive subdomain depth ({len(subdomain_parts)} parts)")
             score += 15
 
-        # 4. Suspicious keywords in URL
         url_lower = self.target_url.lower()
         found_keywords = [kw for kw in SUSPICIOUS_KEYWORDS if kw in url_lower]
         if found_keywords:
             flags.append(f"Contains sensitive/phishing keywords: {', '.join(found_keywords[:4])}")
             score += 15
 
-        # 5. Suspicious TLD
         for tld in SUSPICIOUS_TLDS:
             if self.hostname.endswith(tld):
                 flags.append(f"Uses high-abuse top-level domain ({tld})")
                 score += 20
                 break
 
-        # 6. URL Shortening service
         for shortener in SHORTENER_DOMAINS:
             if shortener in self.hostname:
                 flags.append(f"URL Shortener detected ({shortener}) - target is cloaked")
                 score += 15
                 break
 
-        # 7. Dangerous file extension in path
         path_lower = self.parsed.path.lower()
         for ext in DANGEROUS_EXTENSIONS:
             if path_lower.endswith(ext):
@@ -225,17 +227,15 @@ class URLScanner:
                 score += 40
                 break
 
-        # 8. '@' symbol in URL (credentials masking trick)
         if "@" in self.target_url:
             flags.append("URL contains '@' character (used in URL masking attacks)")
             score += 25
 
-        # 9. Non-standard port
         if self.port not in [80, 443]:
             flags.append(f"Non-standard web port in use ({self.port})")
             score += 10
 
-        self.results["heuristics"]["flags"] = flags
+        self.results["heuristics"]["flags"].extend(flags)
         self.results["heuristics"]["risk_points"] = score
 
     def scan_ssl(self):
@@ -254,12 +254,10 @@ class URLScanner:
                     cipher = ssock.cipher()
                     version = ssock.version()
                     
-                    # Expiry calculation
                     not_after_str = cert.get("notAfter", "")
                     expire_date = datetime.strptime(not_after_str, "%b %d %H:%M:%S %Y %Z") if not_after_str else None
                     days_remaining = (expire_date - datetime.utcnow()).days if expire_date else None
                     
-                    # Extract issuer details
                     issuer_dict = dict(x[0] for x in cert.get("issuer", []))
                     subject_dict = dict(x[0] for x in cert.get("subject", []))
                     
@@ -318,7 +316,6 @@ class URLScanner:
                     self.results["heuristics"]["flags"].append(f"Abnormal redirect chain length ({len(redirect_handler.chain)} redirects)")
                     self.results["heuristics"]["risk_points"] += 15
 
-                # Security headers check
                 self._evaluate_security_headers(headers)
 
         except urllib.error.HTTPError as e:
@@ -344,7 +341,6 @@ class URLScanner:
             }
 
     def _evaluate_security_headers(self, headers):
-        """Audit HTTP security headers and assign grade"""
         headers_lower = {k.lower(): v for k, v in headers.items()}
         
         audit = {
@@ -377,17 +373,16 @@ class URLScanner:
         }
 
     def compute_summary(self):
-        """Aggregate total risk score and final verdict"""
         score = self.results["heuristics"]["risk_points"]
         
-        # Adjust for security headers grade
-        grade = self.results.get("headers_security", {}).get("grade", "F")
-        if grade in ["D", "F"]:
-            score += 10
-        elif grade in ["A", "A+"]:
-            score = max(0, score - 5)
+        # Only adjust for missing headers if the server was reachable
+        if "grade" in self.results.get("headers_security", {}):
+            grade = self.results["headers_security"]["grade"]
+            if grade in ["D", "F"]:
+                score += 10
+            elif grade in ["A", "A+"]:
+                score = max(0, score - 5)
             
-        # Bound score between 0 and 100
         total_score = min(100, max(0, score))
         
         if total_score >= 70:
@@ -411,33 +406,25 @@ class URLScanner:
         }
 
     def run(self):
-        """Execute full intelligence scanning pipeline"""
-        self.scan_dns()
+        dns_ok = self.scan_dns()
         self.scan_heuristics()
-        self.scan_ssl()
-        self.scan_http_and_headers()
+        if dns_ok:
+            self.scan_ssl()
+            self.scan_http_and_headers()
         self.compute_summary()
         return self.results
 
 
-# Formatting & CLI Output
-def print_box_line(left, middle, right, width=72):
-    return f"{left}{middle * (width - 2)}{right}"
-
 def render_report(data):
-    """Render a visually stunning cybersecurity terminal report"""
     w = 74
     c_line = Style.CYAN + "═" * w + Style.RESET
     sub_line = Style.DIM + "─" * w + Style.RESET
 
     print(BANNER)
-    
-    # Target Information Bar
     print(f"{Style.BOLD}{Style.BRIGHT_WHITE}  TARGET URL :{Style.RESET} {Style.BRIGHT_CYAN}{data['target']}{Style.RESET}")
     print(f"{Style.BOLD}{Style.BRIGHT_WHITE}  TIMESTAMP  :{Style.RESET} {Style.DIM}{data['scan_time']}{Style.RESET}")
     print(c_line)
 
-    # 1. Verdict & Risk Gauge
     summary = data["summary"]
     risk = summary["risk_score"]
     verdict = summary["verdict"]
@@ -455,7 +442,6 @@ def render_report(data):
         v_color = Style.BRIGHT_RED
         tag = f"{Style.BG_RED}{Style.BRIGHT_WHITE}  CRITICAL  {Style.RESET}"
 
-    # Progress bar for risk
     filled = int(risk / 5)
     bar = f"{v_color}{'█' * filled}{Style.DIM}{'░' * (20 - filled)}{Style.RESET}"
 
@@ -463,9 +449,8 @@ def render_report(data):
     print(f"  {Style.BOLD}THREAT INDEX  :{Style.RESET} [{bar}] {v_color}{risk}/100{Style.RESET}")
     print(sub_line)
 
-    # 2. DNS & Network Intelligence
     dns = data.get("dns", {})
-    print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}🌐 [1] DNS & INFRASTRUCTURE INTELLIGENCE{Style.RESET}")
+    print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}[1] DNS & INFRASTRUCTURE INTELLIGENCE{Style.RESET}")
     if "error" in dns:
         print(f"    {Style.RED}✖ {dns['error']}{Style.RESET}")
     else:
@@ -477,43 +462,42 @@ def render_report(data):
         private_tag = f"{Style.RED}YES (RFC 1918 Private){Style.RESET}" if dns.get('is_private_ip') else f"{Style.GREEN}NO (Public){Style.RESET}"
         print(f"    {Style.CYAN}• Private IP   :{Style.RESET} {private_tag}")
 
-    # 3. SSL / TLS Security
     ssl_data = data.get("ssl", {})
-    print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}🔒 [2] SSL / TLS CRYPTOGRAPHIC AUDIT{Style.RESET}")
-    if ssl_data.get("secure"):
-        days = ssl_data.get("days_remaining", 0)
-        days_color = Style.GREEN if days > 30 else (Style.YELLOW if days > 0 else Style.RED)
-        print(f"    {Style.GREEN}✔ Protocol     :{Style.RESET} {ssl_data.get('protocol')} ({ssl_data.get('cipher')})")
-        print(f"    {Style.GREEN}✔ Authority    :{Style.RESET} {ssl_data.get('issuer_org')}")
-        print(f"    {Style.GREEN}✔ Expiration   :{Style.RESET} {ssl_data.get('expires_on')} ({days_color}{days} days remaining{Style.RESET})")
-    elif "error" in ssl_data:
-        print(f"    {Style.RED}✖ Error        :{Style.RESET} {ssl_data['error']}")
-    else:
-        print(f"    {Style.YELLOW}⚠ Connection   :{Style.RESET} {ssl_data.get('status', 'Unencrypted HTTP')}")
+    if ssl_data:
+        print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}[2] SSL / TLS CRYPTOGRAPHIC AUDIT{Style.RESET}")
+        if ssl_data.get("secure"):
+            days = ssl_data.get("days_remaining", 0)
+            days_color = Style.GREEN if days > 30 else (Style.YELLOW if days > 0 else Style.RED)
+            print(f"    {Style.GREEN}✔ Protocol     :{Style.RESET} {ssl_data.get('protocol')} ({ssl_data.get('cipher')})")
+            print(f"    {Style.GREEN}✔ Authority    :{Style.RESET} {ssl_data.get('issuer_org')}")
+            print(f"    {Style.GREEN}✔ Expiration   :{Style.RESET} {ssl_data.get('expires_on')} ({days_color}{days} days remaining{Style.RESET})")
+        elif "error" in ssl_data:
+            print(f"    {Style.RED}✖ Error        :{Style.RESET} {ssl_data['error']}")
+        else:
+            print(f"    {Style.YELLOW}⚠ Connection   :{Style.RESET} {ssl_data.get('status', 'Unencrypted HTTP')}")
 
-    # 4. HTTP & Redirection Chain
     http_data = data.get("http", {})
-    print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}⚡ [3] HTTP RESPONSE & REDIRECTIONS{Style.RESET}")
-    if "error" in http_data and "status_code" not in http_data:
-        print(f"    {Style.RED}✖ Error        :{Style.RESET} {http_data['error']}")
-    else:
-        code = http_data.get("status_code", "N/A")
-        code_color = Style.GREEN if str(code).startswith("2") else (Style.YELLOW if str(code).startswith("3") else Style.RED)
-        print(f"    {Style.CYAN}• Status Code  :{Style.RESET} {code_color}{Style.BOLD}{code}{Style.RESET}")
-        print(f"    {Style.CYAN}• Latency      :{Style.RESET} {http_data.get('response_time_ms', 'N/A')} ms")
-        print(f"    {Style.CYAN}• Web Server   :{Style.RESET} {http_data.get('server')}")
-        print(f"    {Style.CYAN}• Content-Type :{Style.RESET} {http_data.get('content_type')}")
-        
-        chain = http_data.get("redirects", [])
-        if chain:
-            print(f"\n    {Style.BOLD}{Style.YELLOW}↪ Redirection Traced ({len(chain)} hops):{Style.RESET}")
-            for idx, hop in enumerate(chain, 1):
-                print(f"      {Style.DIM}[Hop {idx}]{Style.RESET} ({hop['status_code']}) {hop['from_url']} {Style.CYAN}➔{Style.RESET} {hop['to_url']}")
+    if http_data:
+        print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}[3] HTTP RESPONSE & REDIRECTIONS{Style.RESET}")
+        if "error" in http_data and "status_code" not in http_data:
+            print(f"    {Style.RED}✖ Error        :{Style.RESET} {http_data['error']}")
+        else:
+            code = http_data.get("status_code", "N/A")
+            code_color = Style.GREEN if str(code).startswith("2") else (Style.YELLOW if str(code).startswith("3") else Style.RED)
+            print(f"    {Style.CYAN}• Status Code  :{Style.RESET} {code_color}{Style.BOLD}{code}{Style.RESET}")
+            print(f"    {Style.CYAN}• Latency      :{Style.RESET} {http_data.get('response_time_ms', 'N/A')} ms")
+            print(f"    {Style.CYAN}• Web Server   :{Style.RESET} {http_data.get('server')}")
+            print(f"    {Style.CYAN}• Content-Type :{Style.RESET} {http_data.get('content_type')}")
+            
+            chain = http_data.get("redirects", [])
+            if chain:
+                print(f"\n    {Style.BOLD}{Style.YELLOW}↪ Redirection Traced ({len(chain)} hops):{Style.RESET}")
+                for idx, hop in enumerate(chain, 1):
+                    print(f"      {Style.DIM}[Hop {idx}]{Style.RESET} ({hop['status_code']}) {hop['from_url']} {Style.CYAN}➔{Style.RESET} {hop['to_url']}")
 
-    # 5. Security Headers Audit
     headers = data.get("headers_security", {})
     if headers:
-        print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}🛡️  [4] HTTP SECURITY HEADERS AUDIT{Style.RESET}")
+        print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}[4] HTTP SECURITY HEADERS AUDIT{Style.RESET}")
         g = headers.get("grade", "F")
         g_color = Style.GREEN if g in ["A+", "A"] else (Style.YELLOW if g in ["B", "C"] else Style.RED)
         print(f"    {Style.CYAN}• Grade        :{Style.RESET} {g_color}{Style.BOLD}{g}{Style.RESET} ({headers.get('implemented_count')} active)")
@@ -521,9 +505,8 @@ def render_report(data):
             st_color = Style.GREEN + "✔ PRESENT" if status == "PRESENT" else Style.RED + "✖ MISSING"
             print(f"      {Style.DIM}•{Style.RESET} {h_name:<28}: {st_color}{Style.RESET}")
 
-    # 6. Heuristic Red Flags
     flags = data.get("heuristics", {}).get("flags", [])
-    print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}🚩 [5] SUSPICIOUS INDICATORS & THREAT FLAGS ({len(flags)}){Style.RESET}")
+    print(f"\n  {Style.BOLD}{Style.BRIGHT_MAGENTA}[5] SUSPICIOUS INDICATORS & THREAT FLAGS ({len(flags)}){Style.RESET}")
     if not flags:
         print(f"    {Style.GREEN}✔ Zero malicious or phishing indicators detected.{Style.RESET}")
     else:
@@ -584,4 +567,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
